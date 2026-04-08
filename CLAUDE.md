@@ -519,4 +519,150 @@ WeatherAssistant assistant = AiServices.builder(WeatherAssistant.class)
 
 ---
 
+## 13. StreamingChatResponseHandler 流式事件详解
+
+> 源文件：`langchain4j-core/.../model/chat/response/StreamingChatResponseHandler.java`
+
+### 事件总览
+
+`StreamingChatResponseHandler` 是流式聊天模型的回调接口，定义了 **6 个事件**（3 个维度 × 每个维度 2 个重载方法）+ **2 个生命周期事件**。共 8 个方法。
+
+### 事件时序图
+
+```
+StreamingChatModel.chat(request, handler)
+  │
+  ├─ 重复触发（每个 token）:
+  │   ├── onPartialThinking()      ← 1. 推理/思考过程的 token
+  │   ├── onPartialResponse()      ← 2. 正式回复的 token
+  │   └── onPartialToolCall()      ← 3. 工具调用参数的 token
+  │
+  ├─ 单次触发（工具调用完成）:
+  │   └── onCompleteToolCall()     ← 4. 单个工具调用组装完成
+  │
+  └─ 单次触发（流结束）:
+      ├── onCompleteResponse()     ← 5. 整个响应完成（必须实现）
+      └── onError()                ← 6. 发生错误（必须实现）
+```
+
+### 逐事件详解
+
+#### 1. `onPartialResponse` — 正式回复 token
+
+| 项 | 说明 |
+|---|------|
+| **触发时机** | 模型生成正式回复文本，通常每个 token 触发一次 |
+| **承载数据** | `PartialResponse`，内部只有一个 `text` 字段 |
+| **两种重载** | `onPartialResponse(String)` — 简单字符串版本 |
+| | `onPartialResponse(PartialResponse, PartialResponseContext)` — 带上下文版本 |
+| **Context 提供** | `StreamingHandle` — 可通过 `cancel()` 中止流式传输 |
+| **注意** | 部分 provider（如 Bedrock、Google）不逐 token 流式，而是批量返回，此时一次回调可能包含多个 token |
+
+```java
+// 简单用法
+handler.onPartialResponse(String partialResponse) { ... }
+
+// 带取消能力
+handler.onPartialResponse(PartialResponse resp, PartialResponseContext ctx) {
+    String token = resp.text();
+    if (shouldStop) ctx.streamingHandle().cancel();
+}
+```
+
+#### 2. `onPartialThinking` — 推理/思考 token
+
+| 项 | 说明 |
+|---|------|
+| **触发时机** | 模型生成思考/推理过程时（如 Claude 的 extended thinking、DeepSeek 的 reasoning） |
+| **承载数据** | `PartialThinking`，内部只有一个 `text` 字段 |
+| **两种重载** | `onPartialThinking(PartialThinking)` — 简单版本 |
+| | `onPartialThinking(PartialThinking, PartialThinkingContext)` — 带 `StreamingHandle` 版本 |
+| **注意** | 并非所有模型都支持 thinking，不支持的模型不会触发此事件 |
+| **@since** | 1.2.0 |
+
+```java
+handler.onPartialThinking(PartialThinking thinking) {
+    System.out.print("[思考] " + thinking.text());
+}
+```
+
+#### 3. `onPartialToolCall` — 工具调用参数 token
+
+| 项 | 说明 |
+|---|------|
+| **触发时机** | 模型以流式方式生成工具调用的参数 JSON 时 |
+| **承载数据** | `PartialToolCall`，包含 4 个字段 |
+| **核心字段** | `index` — 工具调用序号（从 0 递增，用于关联多次调用） |
+| | `id` — provider 生成的唯一标识（部分 provider 可能省略） |
+| | `name` — 被调用的工具名称 |
+| | `partialArguments` — 参数 JSON 的片段 |
+| **注意** | 部分 provider（Bedrock、Google、Mistral、Ollama）不逐 token 流式传输工具调用参数，而是直接返回完整工具调用，此时此事件不会触发，仅触发 `onCompleteToolCall` |
+
+```java
+// 流式工具调用示例：
+// 1. onPartialToolCall(index=0, id="call_abc", name="get_weather", partialArguments="{\"")
+// 2. onPartialToolCall(index=0, id="call_abc", name="get_weather", partialArguments="city")
+// 3. onPartialToolCall(index=0, id="call_abc", name="get_weather", partialArguments="\":\"")
+// 4. onPartialToolCall(index=0, id="call_abc", name="get_weather", partialArguments="Mun")
+// 5. onPartialToolCall(index=0, id="call_abc", name="get_weather", partialArguments="ich")
+// 6. onPartialToolCall(index=0, id="call_abc", name="get_weather", partialArguments="\"}")
+// 7. onCompleteToolCall(index=0, id="call_abc", name="get_weather", arguments="{\"city\":\"Munich\"}")
+```
+
+#### 4. `onCompleteToolCall` — 单个工具调用完成
+
+| 项 | 说明 |
+|---|------|
+| **触发时机** | 模型完成了一个工具调用的流式生成（即所有 `partialArguments` 已拼装完整） |
+| **承载数据** | `CompleteToolCall`，包含 `index` + `ToolExecutionRequest` |
+| **ToolExecutionRequest** | 包含 `id`、`name`、`arguments`（完整 JSON 字符串），可直接用于执行 |
+| **多次触发** | 如果模型决定调用多个工具，每个工具完成时都会触发一次 |
+| **@since** | 1.2.0 |
+
+#### 5. `onCompleteResponse` — 整个响应完成（必须实现）
+
+| 项 | 说明 |
+|---|------|
+| **触发时机** | 模型完成了整个流式响应 |
+| **承载数据** | `ChatResponse`，包含完整的 `AiMessage` + `ChatResponseMetadata` |
+| **AiMessage** | 包含完整文本 + thinking + 所有 `ToolExecutionRequest` 列表 |
+| **Metadata** | 包含 `id`、`modelName`、`tokenUsage`、`finishReason` |
+| **必须实现** | 此方法没有 default 实现，是唯一必须实现的方法 |
+
+#### 6. `onError` — 流式传输错误（必须实现）
+
+| 项 | 说明 |
+|---|------|
+| **触发时机** | 流式传输过程中发生错误 |
+| **承载数据** | `Throwable` 异常对象 |
+| **必须实现** | 此方法没有 default 实现，是唯一必须实现的方法 |
+
+### StreamingHandle — 流控制
+
+```java
+// 通过 Context 可获取 StreamingHandle
+public interface StreamingHandle {
+    void cancel();          // 中止流式传输
+    boolean isCancelled();  // 查询是否已中止
+}
+```
+
+可用于在 `onPartialResponse` 或 `onPartialThinking` 的带 Context 版本中提前终止流。
+
+### 方法实现要求总结
+
+| 方法 | 是否必须实现 | @since | @Experimental |
+|------|:---:|------:|:---:|
+| `onPartialResponse(String)` | 否 (default 空实现) | — | 否 |
+| `onPartialResponse(PartialResponse, PartialResponseContext)` | 否 (default 委托到 String 版本) | 1.8.0 | 是 |
+| `onPartialThinking(PartialThinking)` | 否 (default 空实现) | 1.2.0 | 是 |
+| `onPartialThinking(PartialThinking, PartialThinkingContext)` | 否 (default 委托到无 Context 版本) | 1.8.0 | 是 |
+| `onPartialToolCall(PartialToolCall)` | 否 (default 空实现) | 1.2.0 | 是 |
+| `onPartialToolCall(PartialToolCall, PartialToolCallContext)` | 否 (default 委托到无 Context 版本) | 1.8.0 | 是 |
+| `onCompleteToolCall(CompleteToolCall)` | 否 (default 空实现) | 1.2.0 | 是 |
+| **`onCompleteResponse(ChatResponse)`** | **是** | — | 否 |
+| **`onError(Throwable)`** | **是** | — | 否 |
+
+---
+
 *分析基于 LangChain4j v1.13.0-beta23-SNAPSHOT 源码，生成于 2026-04-07。*
